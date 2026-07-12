@@ -1,0 +1,717 @@
+# jsonpath.mq — A JSONPath (RFC 9535-style) query engine implemented in mq
+#
+# Evaluates JSONPath expressions against already-parsed mq values (the same
+# dict/array/string/number/bool/None values produced by e.g. `json::json_parse`).
+#
+# API:
+#   query(input, path)             -> array of matched values, in document order
+#   query_first(input, path)       -> first matched value, or None
+#   exists(input, path)            -> true if the path matches at least one node
+#   count(input, path)             -> number of matched nodes
+#   paths(input, path)             -> array of normalized path strings for each match
+#   query_with_paths(input, path)  -> array of {"path": ..., "value": ...}
+#
+# Supported syntax:
+#   $                    root
+#   .name / ['name']     child by name
+#   .*     / [*]         wildcard
+#   ..name / ..*  / ..[] recursive descent
+#   [0]    / [-1]        index (negative counts from the end)
+#   [0:2]  / [::2]       slice (start:end:step, all parts optional)
+#   [a,b]                union of selectors
+#   [?(<expr>)]          filter, with `@` bound to the current node and `$` to the root
+#
+# Filter expressions support ==, !=, <, <=, >, >=, &&, ||, !, parentheses,
+# number/string/true/false/null literals, existence tests, and the functions
+# length(), count(), value(), match(), search().
+#
+# Note: object member order follows mq's own internal dict ordering, which is
+# not guaranteed to match JSON source order (or alphabetical key order).
+
+# ===== Utilities =====
+
+def _jp_hex_digit(c):
+  let cp = first(explode(c))
+  | if (cp >= 48 && cp <= 57): cp - 48
+    elif (cp >= 65 && cp <= 70): cp - 55
+    elif (cp >= 97 && cp <= 102): cp - 87
+    else: error("jsonpath: invalid hex digit: " + c)
+end
+
+def _jp_hex_to_int(hex):
+  fold(to_array(downcase(hex)), 0, fn(acc, c): acc * 16 + _jp_hex_digit(c);)
+end
+
+def _jp_is_digit(c): c >= "0" && c <= "9";
+
+def _jp_is_ident_start(c): is_regex_match(c, "^[a-zA-Z_]$");
+
+def _jp_missing(): {is_missing: true};
+
+def _jp_is_missing(v): is_dict(v) && v == _jp_missing();
+
+def _jp_clamp(v, lo, hi):
+  if (v < lo): lo elif (v > hi): hi else: v
+end
+
+def _jp_normalize_index(i, n):
+  if (i < 0): n + i else: i
+end
+
+# ===== Lexer =====
+
+def _jp_lex_string(s, start, quote_char):
+  var i = start
+  | var buf = ""
+  | let n = len(s)
+  | let _ = while (i < n && s[i] != quote_char):
+      if (s[i] == "\\" && i + 1 < n):
+        do
+          let nc = s[i + 1]
+          | if (nc == "n"): do buf = buf + "\n" | i += 2 | buf end
+            elif (nc == "t"): do buf = buf + "\t" | i += 2 | buf end
+            elif (nc == "r"): do buf = buf + "\r" | i += 2 | buf end
+            elif (nc == "\\"): do buf = buf + "\\" | i += 2 | buf end
+            elif (nc == "\""): do buf = buf + "\"" | i += 2 | buf end
+            elif (nc == "'"): do buf = buf + "'" | i += 2 | buf end
+            elif (nc == "/"): do buf = buf + "/" | i += 2 | buf end
+            elif (nc == "b"): do buf = buf + implode([8]) | i += 2 | buf end
+            elif (nc == "f"): do buf = buf + implode([12]) | i += 2 | buf end
+            elif (nc == "u" && i + 5 < n):
+              do
+                let cp = _jp_hex_to_int(slice(s, i + 2, i + 6))
+                | buf = buf + implode([cp])
+                | i += 6
+                | buf
+              end
+            else: do buf = buf + nc | i += 2 | buf end
+        end
+      else: do buf = buf + s[i] | i += 1 | buf end
+    end
+  | if (i >= n): error("jsonpath: unterminated string literal")
+  | [buf, i + 1]
+end
+
+def _jp_lex(s):
+  var pos = 0
+  | var tokens = []
+  | let n = len(s)
+  | let _ = while (pos < n):
+      let c = s[pos]
+      | if (c == " " || c == "\t" || c == "\n" || c == "\r"):
+          do pos += 1 | tokens end
+        elif (c == "$"): do tokens += [{t: "dollar"}] | pos += 1 | tokens end
+        elif (c == "@"): do tokens += [{t: "at"}] | pos += 1 | tokens end
+        elif (c == "."):
+          do
+            if (pos + 1 < n && s[pos + 1] == "."):
+              do tokens += [{t: "dotdot"}] | pos += 2 | tokens end
+            else: do tokens += [{t: "dot"}] | pos += 1 | tokens end
+          end
+        elif (c == "*"): do tokens += [{t: "star"}] | pos += 1 | tokens end
+        elif (c == "["): do tokens += [{t: "lbracket"}] | pos += 1 | tokens end
+        elif (c == "]"): do tokens += [{t: "rbracket"}] | pos += 1 | tokens end
+        elif (c == ","): do tokens += [{t: "comma"}] | pos += 1 | tokens end
+        elif (c == ":"): do tokens += [{t: "colon"}] | pos += 1 | tokens end
+        elif (c == "?"): do tokens += [{t: "question"}] | pos += 1 | tokens end
+        elif (c == "("): do tokens += [{t: "lparen"}] | pos += 1 | tokens end
+        elif (c == ")"): do tokens += [{t: "rparen"}] | pos += 1 | tokens end
+        elif (c == "&"):
+          do
+            if (pos + 1 < n && s[pos + 1] == "&"):
+              do tokens += [{t: "andand"}] | pos += 2 | tokens end
+            else: error("jsonpath: unexpected character: &")
+          end
+        elif (c == "|"):
+          do
+            if (pos + 1 < n && s[pos + 1] == "|"):
+              do tokens += [{t: "oror"}] | pos += 2 | tokens end
+            else: error("jsonpath: unexpected character: |")
+          end
+        elif (c == "!"):
+          do
+            if (pos + 1 < n && s[pos + 1] == "="):
+              do tokens += [{t: "op", v: "!="}] | pos += 2 | tokens end
+            else: do tokens += [{t: "not"}] | pos += 1 | tokens end
+          end
+        elif (c == "="):
+          do
+            if (pos + 1 < n && s[pos + 1] == "="):
+              do tokens += [{t: "op", v: "=="}] | pos += 2 | tokens end
+            else: error("jsonpath: unexpected character: =")
+          end
+        elif (c == "<"):
+          do
+            if (pos + 1 < n && s[pos + 1] == "="):
+              do tokens += [{t: "op", v: "<="}] | pos += 2 | tokens end
+            else: do tokens += [{t: "op", v: "<"}] | pos += 1 | tokens end
+          end
+        elif (c == ">"):
+          do
+            if (pos + 1 < n && s[pos + 1] == "="):
+              do tokens += [{t: "op", v: ">="}] | pos += 2 | tokens end
+            else: do tokens += [{t: "op", v: ">"}] | pos += 1 | tokens end
+          end
+        elif (c == "\"" || c == "'"):
+          do
+            let r = _jp_lex_string(s, pos + 1, c)
+            | tokens += [{t: "str", v: r[0]}]
+            | pos = r[1]
+            | tokens
+          end
+        elif (_jp_is_digit(c) || (c == "-" && pos + 1 < n && _jp_is_digit(s[pos + 1]))):
+          do
+            let m = first(regex_match(slice(s, pos, n), "^-?[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"))
+            | tokens += [{t: "num", v: to_number(m)}]
+            | pos += len(m)
+            | tokens
+          end
+        elif (_jp_is_ident_start(c)):
+          do
+            let m = first(regex_match(slice(s, pos, n), "^[a-zA-Z_][a-zA-Z0-9_]*"))
+            | tokens += [{t: "name", v: m}]
+            | pos += len(m)
+            | tokens
+          end
+        else:
+          error("jsonpath: unexpected character: " + c)
+    end
+  | tokens
+end
+
+def _jp_tt(tokens, pos):
+  if (pos >= len(tokens)): "eof" else: tokens[pos]["t"]
+end
+
+def _jp_tv(tokens, pos):
+  if (pos >= len(tokens)): None else: tokens[pos]["v"]
+end
+
+def _jp_expect(tokens, pos, tt):
+  if (_jp_tt(tokens, pos) != tt):
+    error("jsonpath: expected '" + tt + "' but got '" + _jp_tt(tokens, pos) + "'")
+  else: pos + 1
+end
+
+# ===== Parser: path segments and selectors =====
+
+def _jp_parse_segments(tokens, pos):
+  var cur = pos
+  | var segs = []
+  | var done = false
+  | let _ = while (!done):
+      let tt = _jp_tt(tokens, cur)
+      | if (tt == "dotdot"):
+          do
+            let r = _jp_parse_descendant_selectors(tokens, cur + 1)
+            | cur = r[1]
+            | segs += [{type: "descendant", selectors: r[0]}]
+            | segs
+          end
+        elif (tt == "dot"):
+          do
+            let r = _jp_parse_dot_selector(tokens, cur + 1)
+            | cur = r[1]
+            | segs += [{type: "child", selectors: [r[0]]}]
+            | segs
+          end
+        elif (tt == "lbracket"):
+          do
+            let r = _jp_parse_bracketed_selectors(tokens, cur)
+            | cur = r[1]
+            | segs += [{type: "child", selectors: r[0]}]
+            | segs
+          end
+        else: do done = true | segs end
+    end
+  | [segs, cur]
+end
+
+def _jp_parse_dot_selector(tokens, pos):
+  let tt = _jp_tt(tokens, pos)
+  | if (tt == "star"): [{type: "wildcard"}, pos + 1]
+    elif (tt == "name"): [{type: "name", name: _jp_tv(tokens, pos)}, pos + 1]
+    else: error("jsonpath: expected name or '*' after '.', got '" + tt + "'")
+end
+
+def _jp_parse_descendant_selectors(tokens, pos):
+  let tt = _jp_tt(tokens, pos)
+  | if (tt == "star"): [[{type: "wildcard"}], pos + 1]
+    elif (tt == "name"): [[{type: "name", name: _jp_tv(tokens, pos)}], pos + 1]
+    elif (tt == "lbracket"): _jp_parse_bracketed_selectors(tokens, pos)
+    else: error("jsonpath: expected selector after '..', got '" + tt + "'")
+end
+
+def _jp_parse_bracketed_selectors(tokens, pos):
+  let start_pos = _jp_expect(tokens, pos, "lbracket")
+  | var cur = start_pos
+  | var sels = []
+  | var done = false
+  | let _ = while (!done):
+      let r = _jp_parse_selector(tokens, cur)
+      | cur = r[1]
+      | sels += [r[0]]
+      | let tt = _jp_tt(tokens, cur)
+      | if (tt == "comma"): do cur += 1 | sels end
+        elif (tt == "rbracket"): do done = true | sels end
+        else: error("jsonpath: expected ',' or ']' in bracketed selection, got '" + tt + "'")
+    end
+  | [sels, cur + 1]
+end
+
+def _jp_parse_selector(tokens, pos):
+  let tt = _jp_tt(tokens, pos)
+  | if (tt == "str"): [{type: "name", name: _jp_tv(tokens, pos)}, pos + 1]
+    elif (tt == "star"): [{type: "wildcard"}, pos + 1]
+    elif (tt == "question"): _jp_parse_filter_selector(tokens, pos + 1)
+    elif (tt == "colon"): _jp_parse_slice(tokens, pos, None)
+    elif (tt == "num"):
+      do
+        let v = _jp_tv(tokens, pos)
+        | if (_jp_tt(tokens, pos + 1) == "colon"): _jp_parse_slice(tokens, pos + 1, v)
+          else: [{type: "index", index: v}, pos + 1]
+      end
+    else: error("jsonpath: unexpected token in selector: '" + tt + "'")
+end
+
+def _jp_parse_slice(tokens, pos, start_val):
+  let colon_pos = _jp_expect(tokens, pos, "colon")
+  | let has_end = _jp_tt(tokens, colon_pos) == "num"
+  | let end_val = if (has_end): _jp_tv(tokens, colon_pos) else: None
+  | let after_end = if (has_end): colon_pos + 1 else: colon_pos
+  | if (_jp_tt(tokens, after_end) == "colon"):
+      do
+        let step_pos = after_end + 1
+        | let has_step = _jp_tt(tokens, step_pos) == "num"
+        | let step_val = if (has_step): _jp_tv(tokens, step_pos) else: None
+        | let final_pos = if (has_step): step_pos + 1 else: step_pos
+        | [{type: "slice", start: start_val, "end": end_val, step: step_val}, final_pos]
+      end
+    else:
+      [{type: "slice", start: start_val, "end": end_val, step: None}, after_end]
+end
+
+def _jp_parse_filter_selector(tokens, pos):
+  let has_paren = _jp_tt(tokens, pos) == "lparen"
+  | let start = if (has_paren): pos + 1 else: pos
+  | let r = _jp_parse_or(tokens, start)
+  | let end_pos = if (has_paren): _jp_expect(tokens, r[1], "rparen") else: r[1]
+  | [{type: "filter", expr: r[0]}, end_pos]
+end
+
+# ===== Parser: filter expressions =====
+
+def _jp_parse_or(tokens, pos):
+  let r = _jp_parse_and(tokens, pos)
+  | var node = r[0]
+  | var cur = r[1]
+  | var done = false
+  | let _ = while (!done):
+      if (_jp_tt(tokens, cur) == "oror"):
+        do
+          let r2 = _jp_parse_and(tokens, cur + 1)
+          | node = {type: "or", left: node, right: r2[0]}
+          | cur = r2[1]
+          | node
+        end
+      else: do done = true | node end
+    end
+  | [node, cur]
+end
+
+def _jp_parse_and(tokens, pos):
+  let r = _jp_parse_not(tokens, pos)
+  | var node = r[0]
+  | var cur = r[1]
+  | var done = false
+  | let _ = while (!done):
+      if (_jp_tt(tokens, cur) == "andand"):
+        do
+          let r2 = _jp_parse_not(tokens, cur + 1)
+          | node = {type: "and", left: node, right: r2[0]}
+          | cur = r2[1]
+          | node
+        end
+      else: do done = true | node end
+    end
+  | [node, cur]
+end
+
+def _jp_parse_not(tokens, pos):
+  if (_jp_tt(tokens, pos) == "not"):
+    do
+      let r = _jp_parse_not(tokens, pos + 1)
+      | [{type: "not", expr: r[0]}, r[1]]
+    end
+  else: _jp_parse_atom(tokens, pos)
+end
+
+def _jp_parse_atom(tokens, pos):
+  if (_jp_tt(tokens, pos) == "lparen"):
+    do
+      let r = _jp_parse_or(tokens, pos + 1)
+      | let end_pos = _jp_expect(tokens, r[1], "rparen")
+      | [r[0], end_pos]
+    end
+  else: _jp_parse_comparison_or_test(tokens, pos)
+end
+
+def _jp_parse_comparison_or_test(tokens, pos):
+  let r = _jp_parse_comparable(tokens, pos)
+  | if (_jp_tt(tokens, r[1]) == "op"):
+      do
+        let op = _jp_tv(tokens, r[1])
+        | let r2 = _jp_parse_comparable(tokens, r[1] + 1)
+        | [{type: "cmp", op: op, left: r[0], right: r2[0]}, r2[1]]
+      end
+    else:
+      [{type: "test", comparable: r[0]}, r[1]]
+end
+
+def _jp_parse_comparable(tokens, pos):
+  let tt = _jp_tt(tokens, pos)
+  | if (tt == "at"):
+      do
+        let r = _jp_parse_segments(tokens, pos + 1)
+        | [{type: "query", query: {type: "query", root: "@", segments: r[0]}}, r[1]]
+      end
+    elif (tt == "dollar"):
+      do
+        let r = _jp_parse_segments(tokens, pos + 1)
+        | [{type: "query", query: {type: "query", root: "$", segments: r[0]}}, r[1]]
+      end
+    elif (tt == "num"): [{type: "literal", value: _jp_tv(tokens, pos)}, pos + 1]
+    elif (tt == "str"): [{type: "literal", value: _jp_tv(tokens, pos)}, pos + 1]
+    elif (tt == "name" && _jp_tv(tokens, pos) == "true"): [{type: "literal", value: true}, pos + 1]
+    elif (tt == "name" && _jp_tv(tokens, pos) == "false"): [{type: "literal", value: false}, pos + 1]
+    elif (tt == "name" && _jp_tv(tokens, pos) == "null"): [{type: "literal", value: None}, pos + 1]
+    elif (tt == "name"): _jp_parse_func_call(tokens, pos)
+    else: error("jsonpath: unexpected token in filter expression: '" + tt + "'")
+end
+
+def _jp_parse_func_call(tokens, pos):
+  let name = _jp_tv(tokens, pos)
+  | let start = _jp_expect(tokens, pos + 1, "lparen")
+  | var cur = start
+  | var args = []
+  | var done = false
+  | let _ = while (!done):
+      let tt = _jp_tt(tokens, cur)
+      | if (tt == "rparen"): do done = true | args end
+        else:
+          do
+            let r = _jp_parse_comparable(tokens, cur)
+            | cur = r[1]
+            | args += [r[0]]
+            | let tt2 = _jp_tt(tokens, cur)
+            | if (tt2 == "comma"): do cur += 1 | args end
+              elif (tt2 == "rparen"): args
+              else: error("jsonpath: expected ',' or ')' in function arguments, got '" + tt2 + "'")
+          end
+    end
+  | [{type: "func", name: name, args: args}, cur + 1]
+end
+
+def _jp_parse(path):
+  let tokens = _jp_lex(to_string(path))
+  | let start = _jp_expect(tokens, 0, "dollar")
+  | let r = _jp_parse_segments(tokens, start)
+  | if (_jp_tt(tokens, r[1]) != "eof"):
+      error("jsonpath: unexpected trailing tokens at position " + to_string(r[1]))
+    else: {type: "query", root: "$", segments: r[0]}
+end
+
+# ===== Evaluator =====
+
+def _jp_children(node):
+  let v = node["value"]
+  | let p = node["path"]
+  | if (is_array(v)):
+      map(range(len(v) - 1), fn(i): {"value": v[i], "path": p + [{"k": "index", "v": i}]};)
+    elif (is_dict(v)):
+      map(entries(v), fn(e): {"value": e[1], "path": p + [{"k": "name", "v": e[0]}]};)
+    else: []
+end
+
+# Depth-first preorder traversal of a node and all of its descendants.
+def _jp_descendants_and_self(node):
+  var stack = [node]
+  | var results = []
+  | let _ = while (!is_empty(stack)):
+      do
+        let cur = stack[0]
+        | let rest_stack = slice(stack, 1, len(stack))
+        | results = results + [cur]
+        | stack = _jp_children(cur) + rest_stack
+        | results
+      end
+    end
+  | results
+end
+
+def _jp_slice_bounds(start, end_val, step, n):
+  if (step >= 0):
+    do
+      let s = if (is_none(start)): 0 else: _jp_clamp(_jp_normalize_index(start, n), 0, n)
+      | let e = if (is_none(end_val)): n else: _jp_clamp(_jp_normalize_index(end_val, n), 0, n)
+      | [s, e]
+    end
+  else:
+    do
+      let s = if (is_none(start)): n - 1 else: _jp_clamp(_jp_normalize_index(start, n), -1, n - 1)
+      | let e = if (is_none(end_val)): -1 else: _jp_clamp(_jp_normalize_index(end_val, n), -1, n - 1)
+      | [e, s]
+    end
+end
+
+def _jp_slice_indices(v, sel):
+  let n = len(v)
+  | let step = if (is_none(sel["step"])): 1 else: sel["step"]
+  | if (step == 0): []
+    else:
+      do
+        let b = _jp_slice_bounds(sel["start"], sel["end"], step, n)
+        | let lower = b[0]
+        | let upper = b[1]
+        | if (step > 0):
+            do
+              var i = lower
+              | var idxs = []
+              | let _ = while (i < upper): idxs += [i] | i += step | idxs end
+              | idxs
+            end
+          else:
+            do
+              var i = upper
+              | var idxs = []
+              | let _ = while (i > lower): idxs += [i] | i += step | idxs end
+              | idxs
+            end
+      end
+end
+
+def _jp_apply_selector(node, sel, root):
+  let v = node["value"]
+  | let p = node["path"]
+  | let t = sel["type"]
+  | if (t == "name"):
+      do
+        if (is_dict(v) && contains(keys(v), sel["name"])):
+          [{"value": v[sel["name"]], "path": p + [{"k": "name", "v": sel["name"]}]}]
+        else: []
+      end
+    elif (t == "wildcard"):
+      do
+        if (is_array(v)):
+          map(range(len(v) - 1), fn(i): {"value": v[i], "path": p + [{"k": "index", "v": i}]};)
+        elif (is_dict(v)):
+          map(entries(v), fn(e): {"value": e[1], "path": p + [{"k": "name", "v": e[0]}]};)
+        else: []
+      end
+    elif (t == "index"):
+      do
+        if (is_array(v)):
+          do
+            let n = len(v)
+            | let idx = _jp_normalize_index(sel["index"], n)
+            | if (idx >= 0 && idx < n): [{"value": v[idx], "path": p + [{"k": "index", "v": idx}]}]
+              else: []
+          end
+        else: []
+      end
+    elif (t == "slice"):
+      do
+        if (is_array(v)):
+          map(_jp_slice_indices(v, sel), fn(i): {"value": v[i], "path": p + [{"k": "index", "v": i}]};)
+        else: []
+      end
+    elif (t == "filter"):
+      do
+        if (is_array(v)):
+          fold(range(len(v) - 1), [], fn(acc, i):
+            let child = {"value": v[i], "path": p + [{"k": "index", "v": i}]}
+            | if (_jp_eval_filter_expr(sel["expr"], child, root)): acc + [child] else: acc
+          ;)
+        elif (is_dict(v)):
+          fold(entries(v), [], fn(acc, e):
+            let child = {"value": e[1], "path": p + [{"k": "name", "v": e[0]}]}
+            | if (_jp_eval_filter_expr(sel["expr"], child, root)): acc + [child] else: acc
+          ;)
+        else: []
+      end
+    else: error("jsonpath: unknown selector type: " + t)
+end
+
+def _jp_apply_selectors(node, selectors, root):
+  flat_map(selectors, fn(sel): _jp_apply_selector(node, sel, root);)
+end
+
+def _jp_apply_segment(seg, node_list, root):
+  if (seg["type"] == "child"):
+    flat_map(node_list, fn(node): _jp_apply_selectors(node, seg["selectors"], root);)
+  else:
+    flat_map(node_list, fn(node):
+      flat_map(_jp_descendants_and_self(node), fn(dn): _jp_apply_selectors(dn, seg["selectors"], root);)
+    ;)
+end
+
+def _jp_eval(q_ast, current, root):
+  let start = if (q_ast["root"] == "@"): [current] else: [root]
+  | fold(q_ast["segments"], start, fn(acc, seg): _jp_apply_segment(seg, acc, root);)
+end
+
+def _jp_resolve_comparable(c, current, root):
+  let t = c["type"]
+  | if (t == "literal"): c["value"]
+    elif (t == "query"):
+      do
+        let results = _jp_eval(c["query"], current, root)
+        | if (is_empty(results)): _jp_missing() else: results[0]["value"]
+      end
+    elif (t == "func"): _jp_eval_func(c, current, root)
+    else: error("jsonpath: unknown comparable type: " + t)
+end
+
+def _jp_comparable_truthy(c, current, root):
+  if (c["type"] == "query"):
+    !is_empty(_jp_eval(c["query"], current, root))
+  else:
+    do
+      let v = _jp_resolve_comparable(c, current, root)
+      | !_jp_is_missing(v) && !is_none(v) && v != false
+    end
+end
+
+def _jp_apply_cmp(op, a, b):
+  let am = _jp_is_missing(a)
+  | let bm = _jp_is_missing(b)
+  | if (op == "=="):
+      do if (am || bm): am && bm else: a == b end
+    elif (op == "!="):
+      do if (am || bm): !(am && bm) else: a != b end
+    elif (am || bm): false
+    elif (op == "<"): a < b
+    elif (op == "<="): a <= b
+    elif (op == ">"): a > b
+    elif (op == ">="): a >= b
+    else: error("jsonpath: unknown operator: " + op)
+end
+
+def _jp_eval_func(c, current, root):
+  let name = c["name"]
+  | let args = c["args"]
+  | if (name == "length"):
+      do
+        if (len(args) != 1): error("jsonpath: length() takes exactly 1 argument")
+        else:
+          do
+            let v = _jp_resolve_comparable(args[0], current, root)
+            | if (_jp_is_missing(v)): _jp_missing()
+              elif (is_string(v)): len(v)
+              elif (is_array(v)): len(v)
+              elif (is_dict(v)): len(keys(v))
+              else: _jp_missing()
+          end
+      end
+    elif (name == "count"):
+      do
+        if (len(args) != 1): error("jsonpath: count() takes exactly 1 argument")
+        else:
+          do
+            let arg = args[0]
+            | if (arg["type"] == "query"): len(_jp_eval(arg["query"], current, root))
+              else: 0
+          end
+      end
+    elif (name == "value"):
+      do
+        if (len(args) != 1): error("jsonpath: value() takes exactly 1 argument")
+        else:
+          do
+            let arg = args[0]
+            | if (arg["type"] == "query"):
+                do
+                  let results = _jp_eval(arg["query"], current, root)
+                  | if (len(results) == 1): results[0]["value"] else: _jp_missing()
+                end
+              else: _jp_resolve_comparable(arg, current, root)
+          end
+      end
+    elif (name == "match" || name == "search"):
+      do
+        if (len(args) != 2): error("jsonpath: " + name + "() takes exactly 2 arguments")
+        else:
+          do
+            let sv = _jp_resolve_comparable(args[0], current, root)
+            | let pv = _jp_resolve_comparable(args[1], current, root)
+            | if (_jp_is_missing(sv) || _jp_is_missing(pv) || !is_string(sv) || !is_string(pv)): false
+              elif (name == "match"): is_regex_match(sv, "^(?:" + pv + ")$")
+              else: is_regex_match(sv, pv)
+          end
+      end
+    else: error("jsonpath: unknown function: " + name)
+end
+
+def _jp_eval_filter_expr(expr, current, root):
+  let t = expr["type"]
+  | if (t == "or"): _jp_eval_filter_expr(expr["left"], current, root) || _jp_eval_filter_expr(expr["right"], current, root)
+    elif (t == "and"): _jp_eval_filter_expr(expr["left"], current, root) && _jp_eval_filter_expr(expr["right"], current, root)
+    elif (t == "not"): !_jp_eval_filter_expr(expr["expr"], current, root)
+    elif (t == "cmp"):
+      do
+        let lv = _jp_resolve_comparable(expr["left"], current, root)
+        | let rv = _jp_resolve_comparable(expr["right"], current, root)
+        | _jp_apply_cmp(expr["op"], lv, rv)
+      end
+    elif (t == "test"): _jp_comparable_truthy(expr["comparable"], current, root)
+    else: error("jsonpath: unknown filter expression type: " + t)
+end
+
+def _jp_path_to_string(path_list):
+  "$" + join(map(path_list, fn(seg):
+    if (seg["k"] == "name"): "['" + seg["v"] + "']" else: "[" + to_string(seg["v"]) + "]";
+  ), "")
+end
+
+def _jp_run(input, path):
+  let ast = _jp_parse(path)
+  | let root_node = {"value": input, "path": []}
+  | _jp_eval(ast, root_node, root_node)
+end
+
+# ===== Public API =====
+
+# Evaluates a JSONPath expression against `input` and returns an array of
+# all matched values, in document order.
+def query(input, path):
+  map(_jp_run(input, path), fn(n): n["value"];)
+end
+
+# Evaluates a JSONPath expression and returns only the first matched value,
+# or None if there is no match.
+def query_first(input, path):
+  let results = _jp_run(input, path)
+  | if (is_empty(results)): None else: results[0]["value"]
+end
+
+# Returns true if the JSONPath expression matches at least one node.
+def exists(input, path):
+  !is_empty(_jp_run(input, path))
+end
+
+# Returns the number of nodes matched by the JSONPath expression.
+def count(input, path):
+  len(_jp_run(input, path))
+end
+
+# Returns an array of RFC 9535 normalized path strings, one for each match,
+# e.g. "$['store']['book'][0]['title']".
+def paths(input, path):
+  map(_jp_run(input, path), fn(n): _jp_path_to_string(n["path"]);)
+end
+
+# Returns an array of {"path": <normalized path string>, "value": <value>}
+# for each match.
+def query_with_paths(input, path):
+  map(_jp_run(input, path), fn(n): {"path": _jp_path_to_string(n["path"]), "value": n["value"]};)
+end
