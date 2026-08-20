@@ -41,6 +41,20 @@ If you copied it to the mq built-in module directory:
 mq -I json 'import "jsonpath" | jsonpath::query(., "$..price")' data.json
 ```
 
+### HTTP Import (no local installation needed)
+
+If `mq` was built with the `http-import` feature, you can import directly from GitHub without any local setup. This requires the `--allow-http-import` flag, which is disabled by default:
+
+```sh
+mq --allow-http-import -I json 'import "github.com/harehare/jsonpath.mq" | jsonpath::query(., "$..price")' data.json
+```
+
+Pin to a specific release with `@vX.Y.Z`:
+
+```sh
+mq --allow-http-import -I json 'import "github.com/harehare/jsonpath.mq@v1.0.0" | jsonpath::query(., "$..price")' data.json
+```
+
 ## API
 
 ### `query(input, path)`
